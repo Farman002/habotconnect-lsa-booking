@@ -4,8 +4,6 @@
 
 A production-oriented Django REST Framework backend prototype for connecting parents with Learning Support Assistants (LSAs). The project demonstrates relational data modeling, optimized LSA search, safe booking creation, double-booking prevention, mock payment integration, payment webhooks, automated testing, and GitHub Actions CI.
 
-> **Submission note:** Replace the placeholder author/contact information with your own details before final submission.
-
 ---
 
 ## 1. Project Overview
