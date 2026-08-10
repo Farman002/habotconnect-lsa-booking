@@ -1,140 +1,543 @@
 # HabotConnect LSA Service Booking Backend
 
-**Python Backend Developer Hiring Project**
+**Python Backend Developer Hiring Project — HabotConnect**
 
-A production-oriented Django REST Framework prototype for connecting parents with Learning Support Assistants (LSAs), searching available LSAs, preventing double bookings, integrating with a mock payment provider, and processing payment webhooks.
+A production-oriented Django REST Framework backend prototype for connecting parents with Learning Support Assistants (LSAs). The project demonstrates relational data modeling, optimized LSA search, safe booking creation, double-booking prevention, mock payment integration, payment webhooks, automated testing, and GitHub Actions CI.
 
-## 1. Architecture
+> **Submission note:** Replace the placeholder author/contact information with your own details before final submission.
 
-The project uses **Django + Django REST Framework** with a relational database. Django's MVT architecture is used because the assessment explicitly asks for Django MVT/Flask MVC awareness; for an API-only backend, the Django models represent the data layer, DRF serializers validate/transform API data, and API views coordinate HTTP behavior.
+---
 
-### Main flow
+## 1. Project Overview
+
+The backend supports the following core workflow:
 
 ```text
-Client
+Parent
   |
-  +--> POST /api/v1/bookings/
-  |       |
-  |       +--> validate request
-  |       +--> transaction + LSA row lock
-  |       +--> overlap check
-  |       +--> create PENDING_PAYMENT booking
-  |       +--> requests -> mock payment service
-  |       +--> CONFIRMED / PAYMENT_FAILED
+  | searches for suitable LSA
+  v
+GET /api/v1/lsas/search/
   |
-  +--> GET /api/v1/lsas/search/
-          |
-          +--> DB-level skill filtering
-          +--> overlap exclusion
-          +--> prefetch_related(skills)
-          +--> JSON response
+  | selects available LSA + time slot
+  v
+POST /api/v1/bookings/
+  |
+  +--> validate request
+  +--> lock selected LSA row
+  +--> check overlapping active bookings
+  +--> calculate session amount
+  +--> create payment record
+  +--> call mock payment provider
+  |
+  +--> payment success -> CONFIRMED
+  |
+  +--> payment failure -> PAYMENT_FAILED
 
 Payment Provider
   |
-  +--> POST /api/v1/payments/webhook/
-          |
-          +--> lock payment
-          +--> update payment + booking state
+  v
+POST /api/v1/payments/webhook/
+  |
+  +--> lock payment
+  +--> update Payment state
+  +--> update Booking state
 ```
 
-## 2. Database
+The implementation is intentionally structured so the main business rules live in service/selector code rather than being scattered across HTTP views.
 
-Entities:
+---
 
-- **Parent** – the customer requesting a session.
-- **LSAProfile** – Learning Support Assistant profile and hourly rate.
-- **Skill** – normalized skill vocabulary used in the many-to-many LSA relationship.
-- **Booking** – requested session, parent, LSA, amount, status and idempotency key.
-- **Payment** – one-to-one payment record for a booking.
+## 2. Technology Stack
 
-Indexes are defined for parent email, LSA active status/rate, booking slot lookups, booking status and payment status/transaction ID.
+| Area | Technology |
+|---|---|
+| Language | Python |
+| Web framework | Django |
+| REST API | Django REST Framework |
+| Production database | PostgreSQL |
+| Local fallback | SQLite |
+| HTTP integration | `requests` |
+| Testing | Pytest + pytest-django |
+| CI/CD | GitHub Actions |
+| Version control | Git / GitHub |
 
-## 3. Double-booking prevention
+---
 
-The booking service uses a database transaction and `select_for_update()` on the selected LSA row. While that row is locked, it checks for an existing active booking whose time interval overlaps the requested interval:
+## 3. Architecture — Django MVT
+
+This project uses Django's **MVT (Model–View–Template)** architecture, with Django REST Framework providing the API layer.
+
+For an API-only backend:
+
+- **Model** → database entities and relationships.
+- **View / APIView** → HTTP request/response handling.
+- **Serializer** → request validation and response representation.
+- **Selector** → optimized read/query logic.
+- **Service** → business operations and third-party integration.
+- **Template** → not required because this application exposes REST APIs rather than server-rendered HTML pages.
+
+### Why Django?
+
+Django provides:
+
+- a mature ORM;
+- database migrations;
+- transaction support;
+- validation infrastructure;
+- a well-defined project structure.
+
+DRF adds API-specific request parsing, serializers, status codes and API views.
+
+---
+
+## 4. Database Design
+
+### Entities
+
+- **Parent** — customer requesting a session.
+- **LSAProfile** — Learning Support Assistant profile and hourly rate.
+- **Skill** — normalized skill vocabulary.
+- **Booking** — requested session, parent, LSA, amount, status and idempotency key.
+- **Payment** — one-to-one payment record for a booking.
+
+### Relationships
 
 ```text
-existing.start < requested.end
-AND
-existing.end > requested.start
+Parent 1 ───────────────< Booking >────────────── 1 LSAProfile
+                              |
+                              |
+                              1
+                              |
+                              v
+                           Payment
+
+LSAProfile >──────────────< Skill
+             Many-to-Many
 ```
 
-If an overlap exists, the request is rejected. Locking the LSA row is important because a simple application-level `exists()` check can race when two requests arrive at the same time.
+### Important fields
 
-## 4. N+1 query prevention
+```text
+Parent
+------
+id
+name
+email (unique)
+phone
+created_at
 
-The LSA search uses database-side filtering and `prefetch_related("skills")`. The serializer then reads the already-prefetched skills instead of performing one SQL query per LSA.
+LSAProfile
+----------
+id
+name
+email (unique)
+hourly_rate
+is_active
+created_at
 
-For a search requiring multiple skills, the query uses an annotation/count to ensure an LSA matches all requested skills rather than merely any one skill.
+Skill
+-----
+id
+name (unique)
 
-## 5. API specification
+Booking
+-------
+id
+parent_id
+lsa_id
+session_date
+start_time
+end_time
+amount
+status
+idempotency_key (unique)
+created_at
+updated_at
 
-### POST `/api/v1/bookings/`
+Payment
+-------
+id
+booking_id (one-to-one)
+transaction_id (unique)
+amount
+status
+provider_message
+created_at
+updated_at
+```
+
+### Indexing
+
+Indexes support common access patterns including:
+
+- parent email;
+- active LSA lookup;
+- LSA hourly rate;
+- LSA/date/booking start-time lookup;
+- booking status;
+- parent/status;
+- payment status;
+- payment transaction ID.
+
+The `Booking` model also has a database check constraint requiring:
+
+```text
+end_time > start_time
+```
+
+---
+
+## 5. Double-Booking Prevention
+
+This is one of the key production-safety rules in the project.
+
+When a booking request arrives, the service:
+
+1. starts a database transaction;
+2. locks the selected LSA row using `select_for_update()`;
+3. checks active bookings for the requested date;
+4. detects interval overlap;
+5. rejects the request if a conflict exists;
+6. otherwise creates the booking.
+
+The overlap condition is:
+
+```text
+existing.start_time < requested.end_time
+AND
+existing.end_time > requested.start_time
+```
+
+Example:
+
+```text
+Existing booking
+12:00 ───────── 13:00
+
+New request
+        12:30 ───────── 13:30
+
+Result: REJECTED
+```
+
+### Why the row lock matters
+
+A simple:
+
+```python
+Booking.objects.filter(...).exists()
+```
+
+check can race when two requests arrive at almost the same time.
+
+`select_for_update()` serializes booking decisions for the selected LSA within the transaction, preventing both requests from observing the same free slot and proceeding concurrently.
+
+---
+
+## 6. LSA Search and N+1 Optimization
+
+### Endpoint
+
+```text
+GET /api/v1/lsas/search/
+```
+
+Example:
+
+```text
+/api/v1/lsas/search/?skills=Python,Math
+```
+
+Optional availability parameters:
+
+```text
+/api/v1/lsas/search/?skills=Python,Math&session_date=2026-08-12&start_time=10:00:00&end_time=11:00:00
+```
+
+### Multi-skill behavior
+
+If the request contains:
+
+```text
+Python,Math
+```
+
+the LSA must have **both** skills.
+
+The query performs case-insensitive skill matching and uses database-side filtering/annotation rather than loading all LSAs into Python.
+
+### N+1 problem
+
+Without eager loading:
+
+```text
+1 query -> LSAs
+N queries -> skills for each LSA
+```
+
+With:
+
+```python
+prefetch_related("skills")
+```
+
+the related skills are fetched in a bounded number of queries and reused during serialization.
+
+A regression test measures query growth so the optimization is protected against accidental future changes.
+
+---
+
+## 7. API Specification
+
+### 7.1 Health endpoint
+
+```http
+GET /
+```
+
+Example response:
+
+```json
+{
+  "project": "HabotConnect LSA Booking API",
+  "status": "running",
+  "version": "v1",
+  "message": "Backend API is running successfully"
+}
+```
+
+---
+
+### 7.2 Search LSAs
+
+```http
+GET /api/v1/lsas/search/
+```
+
+Example:
+
+```text
+/api/v1/lsas/search/?skills=Python,Math
+```
+
+---
+
+### 7.3 Create booking
+
+```http
+POST /api/v1/bookings/
+Content-Type: application/json
+```
 
 Request:
 
 ```json
 {
   "parent_id": 1,
-  "lsa_id": 2,
+  "lsa_id": 1,
   "session_date": "2026-08-12",
-  "start_time": "10:00:00",
-  "end_time": "11:00:00",
-  "idempotency_key": "parent-1-20260812-1000"
+  "start_time": "12:00:00",
+  "end_time": "13:00:00",
+  "idempotency_key": "booking-demo-003"
 }
 ```
 
-Success: `201 Created`
-
-The server calculates the booking amount from the LSA hourly rate and session duration.
-
-### GET `/api/v1/lsas/search/`
-
-Example:
+The server calculates the amount from:
 
 ```text
-/api/v1/lsas/search/?skills=Python,Math&session_date=2026-08-12&start_time=10:00:00&end_time=11:00:00
+hourly rate × session duration
 ```
 
-The optional date/time parameters allow the API to exclude LSAs with overlapping active bookings.
+A successful payment results in a confirmed booking.
 
-### POST `/api/v1/payments/webhook/`
+---
+
+### 7.4 Mock payment gateway
+
+```http
+POST /api/v1/mock-gateway/charge/
+Content-Type: application/json
+```
 
 Request:
 
 ```json
 {
-  "transaction_id": "MOCK-ABC123",
-  "event": "payment.success",
-  "message": "settled"
+  "booking_id": 2,
+  "amount": 500,
+  "customer_email": "parent@example.com"
 }
 ```
 
-Events supported:
+Success response:
 
-- `payment.success` -> payment SUCCESS + booking CONFIRMED
-- `payment.failed` -> payment FAILED + booking PAYMENT_FAILED
+```json
+{
+  "success": true,
+  "transaction_id": "MOCK-8C2731B8EB4349DA",
+  "message": "Mock payment successful"
+}
+```
 
-### POST `/api/v1/mock-gateway/charge/`
+### Deterministic failure
 
-This is a local mock provider used to demonstrate the third-party integration. The booking service calls it through the `requests` library.
+For demonstration/testing, an email ending in:
 
-To demonstrate failure, use a customer email ending in `@fail.test`.
+```text
+@fail.test
+```
 
-## 6. Setup
+causes the mock provider to return a payment decline.
 
-### Windows PowerShell
+---
+
+### 7.5 Payment webhook
+
+```http
+POST /api/v1/payments/webhook/
+Content-Type: application/json
+```
+
+Success event:
+
+```json
+{
+  "transaction_id": "MOCK-8C2731B8EB4349DA",
+  "event": "payment.success",
+  "message": "Payment confirmed by provider"
+}
+```
+
+Failure event:
+
+```json
+{
+  "transaction_id": "MOCK-8C2731B8EB4349DA",
+  "event": "payment.failed",
+  "message": "Payment declined by provider"
+}
+```
+
+State transitions:
+
+```text
+payment.success
+    -> Payment.SUCCESS
+    -> Booking.CONFIRMED
+
+payment.failed
+    -> Payment.FAILED
+    -> Booking.PAYMENT_FAILED
+```
+
+Webhook processing uses a transaction and `select_for_update()` on the payment record.
+
+---
+
+## 8. Project Structure
+
+```text
+habotconnect_lsa_booking/
+│
+├── .github/
+│   └── workflows/
+│       └── tests.yml
+│
+├── booking/
+│   ├── migrations/
+│   ├── models.py
+│   ├── serializers.py
+│   ├── selectors.py
+│   ├── services.py
+│   ├── validators.py
+│   ├── views.py
+│   └── urls.py
+│
+├── payments/
+│   ├── services.py
+│   ├── views.py
+│   └── urls.py
+│
+├── tests/
+│   ├── conftest.py
+│   ├── test_bookings.py
+│   ├── test_lsa_search.py
+│   └── test_webhook.py
+│
+├── config/
+│   ├── settings.py
+│   ├── urls.py
+│   └── wsgi.py
+│
+├── manage.py
+├── requirements.txt
+├── pytest.ini
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+---
+
+## 9. Local Setup
+
+### Windows
+
+Create a virtual environment:
 
 ```powershell
 python -m venv .venv
+```
+
+Activate:
+
+```powershell
 .\.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```powershell
 pip install -r requirements.txt
+```
+
+Create environment file:
+
+```powershell
 Copy-Item .env.example .env
+```
+
+Run migrations:
+
+```powershell
 python manage.py migrate
+```
+
+Start the development server:
+
+```powershell
 python manage.py runserver
 ```
 
-If PowerShell execution policy blocks activation, run:
+Open:
+
+```text
+http://127.0.0.1:8000/
+```
+
+Expected:
+
+```json
+{
+  "project": "HabotConnect LSA Booking API",
+  "status": "running",
+  "version": "v1",
+  "message": "Backend API is running successfully"
+}
+```
+
+If PowerShell blocks virtual-environment activation:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -142,35 +545,87 @@ If PowerShell execution policy blocks activation, run:
 .\.venv\Scripts\python.exe manage.py runserver
 ```
 
-### PostgreSQL
+---
 
-Set `DATABASE_URL` in `.env`:
+## 10. Environment Variables
+
+Example `.env`:
+
+```text
+DJANGO_SECRET_KEY=change-this-in-development
+DJANGO_DEBUG=True
+DATABASE_URL=
+MOCK_PAYMENT_URL=http://127.0.0.1:8000/api/v1/mock-gateway/charge/
+PAYMENT_TIMEOUT_SECONDS=5
+```
+
+For PostgreSQL:
 
 ```text
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/habotconnect
 ```
 
-The repository falls back to SQLite for quick local evaluation when `DATABASE_URL` is empty.
+Do not commit the real `.env` file or secrets to GitHub.
 
-## 7. Seed test data
+---
 
-Use Django shell:
+## 11. Seed Development Data
+
+Open Django shell:
 
 ```powershell
 python manage.py shell
 ```
 
+Then:
+
 ```python
 from booking.models import Parent, LSAProfile, Skill
 
-parent = Parent.objects.create(name="Aarav Parent", email="aarav@example.com")
-python_skill = Skill.objects.create(name="Python")
-math_skill = Skill.objects.create(name="Math")
-lsa = LSAProfile.objects.create(name="Sara LSA", email="sara@example.com", hourly_rate=500)
-lsa.skills.add(python_skill, math_skill)
+parent, _ = Parent.objects.get_or_create(
+    email="parent@example.com",
+    defaults={
+        "name": "Rahul Sharma",
+        "phone": "9876543210",
+    },
+)
+
+python_skill, _ = Skill.objects.get_or_create(name="Python")
+math_skill, _ = Skill.objects.get_or_create(name="Math")
+english_skill, _ = Skill.objects.get_or_create(name="English")
+
+lsa1, _ = LSAProfile.objects.get_or_create(
+    email="lsa1@example.com",
+    defaults={
+        "name": "Priya Singh",
+        "hourly_rate": 500,
+        "is_active": True,
+    },
+)
+
+lsa1.skills.set([python_skill, math_skill])
+
+lsa2, _ = LSAProfile.objects.get_or_create(
+    email="lsa2@example.com",
+    defaults={
+        "name": "Amit Kumar",
+        "hourly_rate": 400,
+        "is_active": True,
+    },
+)
+
+lsa2.skills.set([english_skill])
 ```
 
-## 8. Testing
+Exit:
+
+```python
+exit()
+```
+
+---
+
+## 12. Testing
 
 Run:
 
@@ -178,52 +633,156 @@ Run:
 pytest -q
 ```
 
-The suite covers:
+The current local project has been verified with:
 
-1. Successful booking/payment.
-2. Invalid time range.
-3. Overlapping booking rejection.
-4. Payment failure state transition.
-5. Payment provider exception handling.
-6. Multi-skill LSA search.
-7. Availability exclusion.
-8. N+1 regression protection.
-9. Payment webhook state transition.
+```text
+10 passed
+```
 
-## 9. CI/CD
+The test coverage includes:
 
-`.github/workflows/tests.yml` runs on push and pull request. It starts PostgreSQL, installs dependencies, runs migrations and executes Pytest.
+- successful booking/payment;
+- invalid time range;
+- overlapping booking rejection;
+- payment failure transition;
+- payment provider exception handling;
+- multi-skill LSA search;
+- availability exclusion;
+- N+1 query regression protection;
+- payment webhook state transition.
 
-## 10. Production hardening discussion
+---
 
-For a production deployment, add:
+## 13. CI/CD
 
-- authenticated API access and role-based permissions;
-- signed webhook verification and replay protection;
-- idempotency enforcement at the API boundary;
-- HTTPS and secure secrets management;
-- structured JSON logging and monitoring;
-- rate limiting;
+GitHub Actions workflow:
+
+```text
+.github/workflows/tests.yml
+```
+
+The workflow:
+
+1. checks out the repository;
+2. starts PostgreSQL 16 as a service;
+3. configures CI environment variables;
+4. installs Python dependencies;
+5. runs Django migrations;
+6. executes Pytest.
+
+The workflow runs on:
+
+- push;
+- pull request.
+
+### Current CI result
+
+The repository has successfully completed a GitHub Actions run for the initial backend commit.
+
+---
+
+## 14. Production Hardening
+
+This project is a hiring-project prototype. For production, additional controls would be appropriate:
+
+- authentication and authorization;
+- role-based API permissions;
+- signed webhook verification;
+- webhook replay protection;
+- stronger idempotency handling;
+- HTTPS;
+- secure secret management;
+- structured JSON logging;
+- monitoring and alerting;
+- API rate limiting;
 - PostgreSQL as the production database;
-- a real payment provider adapter;
-- background jobs for non-critical provider work;
-- API schema generation/OpenAPI;
-- stronger database-level exclusion constraints if PostgreSQL range types are adopted.
+- real payment-provider adapter;
+- asynchronous jobs where appropriate;
+- OpenAPI schema/documentation;
+- stronger PostgreSQL-specific concurrency constraints where suitable.
 
-## 11. Interview talking points
+---
 
-### Why Django MVT?
-
-Django provides a mature ORM, migrations, transactions and an established application structure. DRF adds serializers, request parsing, status handling and API-oriented views. For this API-only project, templates are not needed, but the underlying Django separation still maps cleanly to the MVT architecture.
+## 15. Key Design Decisions
 
 ### Why `select_for_update()`?
 
-Without a lock, two simultaneous booking requests could both observe an apparently free slot and create conflicting bookings. Locking the LSA row serializes booking decisions for that LSA inside the transaction.
+It protects the booking decision from concurrent requests for the same LSA.
 
 ### Why `prefetch_related()`?
 
-Skills are a many-to-many relationship. Reading them individually for every LSA would create an N+1 query pattern. Prefetching retrieves the related rows in a bounded number of queries and joins them in Python.
+`LSAProfile.skills` is a many-to-many relationship. Prefetching prevents a separate skill query for every returned LSA.
+
+### Why a selector layer?
+
+Read/query logic is isolated from HTTP handling, making query optimization easier to test and maintain.
+
+### Why a service layer?
+
+Business operations such as booking/payment coordination and third-party integration should not be tightly coupled to API views.
 
 ### Why a webhook?
 
-A payment result can change asynchronously after the original request. The webhook gives the payment provider a reliable mechanism to tell the backend about the final state.
+Payment state can change asynchronously. The webhook gives the provider a mechanism to communicate the final payment event to the backend.
+
+### Why MVT rather than MVC?
+
+Django's native architecture is MVT. For this API-only backend, templates are not used, while models, views and DRF serializers/services provide a clean separation of responsibilities.
+
+---
+
+## 16. Interview Demonstration Checklist
+
+During the project interview, demonstrate:
+
+```text
+1. GET /api/v1/lsas/search/
+2. Multi-skill filtering
+3. POST /api/v1/bookings/
+4. Successful payment
+5. Overlapping booking rejection
+6. Payment failure
+7. Payment webhook
+8. Database state transition
+9. N+1 query test
+10. pytest -q
+11. GitHub Actions result
+```
+
+Be prepared to explain:
+
+- the database relationships;
+- transaction boundaries;
+- `select_for_update()`;
+- overlap detection;
+- `prefetch_related()`;
+- N+1 queries;
+- service vs selector responsibilities;
+- payment failure handling;
+- webhook state transitions;
+- CI workflow.
+
+---
+
+## 17. Repository
+
+GitHub:
+
+**https://github.com/Farman002/habotconnect-lsa-booking**
+
+---
+
+## 18. Submission Deliverables
+
+The repository should contain:
+
+- Python/Django codebase;
+- database models and migrations;
+- API routes;
+- automated tests;
+- GitHub Actions workflow;
+- README documentation;
+- project presentation.
+
+Before final submission, verify that the repository is public and that the latest GitHub Actions run is green.
+
